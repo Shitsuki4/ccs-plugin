@@ -6,8 +6,9 @@
 #   /ccs map <id> <model>         -> claude: tier picker (sonnet / sonnet[1m] / opus / ...)
 #   /ccs map <id> <model> <tier>  -> claude: offer "/model <alias>" for the current session
 #
-# Buttons use cc-connect's native "cmd:" card action, so clicks are dispatched as commands
-# from the clicking user; ccs.ps1 does the actual work.
+# Pickers are select_static dropdowns whose option values are "cmd:..." commands, so a
+# selection is dispatched as a command from the clicking user and chains into the next
+# card (cascader-style provider -> model -> alias). ccs.ps1 does the actual work.
 [CmdletBinding()]
 param(
     [ValidatePattern('^[a-z\-]+$')][string]$AppType = '',
@@ -82,6 +83,26 @@ function New-CmdButton([string]$Label, [string]$Command, [string]$Type, [string]
     @{ tag = 'button'; text = @{ tag = 'plain_text'; content = $Label }; type = $Type; value = $value }
 }
 
+# select_static dropdown: the picked option's value lands in the callback's Action.Option,
+# which cc-connect only dispatches when it carries the "cmd:" prefix, so both option values
+# and initial_option get it prepended here. The element value map carries session_key and
+# the after_click feedback card (Action.Value).
+function New-SelectRow([string]$Placeholder, $Options, [string]$InitValue, [string]$AfterTitle, [string]$AfterMarkdown) {
+    $opts = @($Options | ForEach-Object {
+        @{ text = @{ tag = 'plain_text'; content = [string]$_.Text }; value = "cmd:$($_.Value)" }
+    })
+    $value = @{ session_key = $sessionKey }
+    if ($AfterTitle) { $value.after_click = @{ title = $AfterTitle; color = 'blue'; markdown = $(if ($AfterMarkdown) { $AfterMarkdown } else { '结果稍后以消息回复。' }) } }
+    $elem = @{
+        tag         = 'select_static'
+        placeholder = @{ tag = 'plain_text'; content = $Placeholder }
+        options     = $opts
+        value       = $value
+    }
+    if ($InitValue) { $elem.initial_option = "cmd:$InitValue" }
+    @{ tag = 'action'; actions = @($elem) }
+}
+
 function Add-ButtonRows($Elements, $Buttons, [int]$PerRow = 4) {
     $buttons = @($Buttons)
     for ($i = 0; $i -lt $buttons.Count; $i += $PerRow) {
@@ -114,13 +135,14 @@ function New-ProvidersCard($Catalog) {
     if ($Catalog.ProxyManaged -and -not $Catalog.ProxyRunning) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '⚠️ 本地代理未运行，切换不会生效' } }) }
     if ($Catalog.AutoFailover) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '⚠️ 已开启自动故障转移，手动切换会被拒绝' } }) }
 
-    $buttons = foreach ($p in ($Catalog.Providers | Where-Object { $_.Selectable })) {
-        $label = $p.Name
-        if ($p.Model) { $label += " · $($p.Model)" } elseif ($p.Models.Count -gt 0) { $label += " · $($p.Models.Count) 模型" }
-        if ($p.Current) { $label = "✅ $label" }
-        New-CmdButton $label "/ccs switch $($p.Id)" $(if ($p.Current) { 'primary' } else { 'default' }) "⏳ 正在切换到 $($p.Name)…" '切换结果和模型列表稍后发出。'
+    $options = foreach ($p in ($Catalog.Providers | Where-Object { $_.Selectable })) {
+        $text = $p.Name
+        if ($p.Model) { $text += " · $($p.Model)" } elseif ($p.Models.Count -gt 0) { $text += " · $($p.Models.Count) 模型" }
+        if ($p.Current) { $text = "✅ $text" }
+        @{ Text = $text; Value = "/ccs switch $($p.Id)" }
     }
-    Add-ButtonRows $elements $buttons 4
+    $currentOpt = if ($current) { "/ccs switch $($current.Id)" } else { $null }
+    [void]$elements.Add((New-SelectRow '选择要切换的供应商…' $options $currentOpt "⏳ 已选供应商，正在切换…" '切换结果和模型列表稍后发出。'))
     $blocked = @($Catalog.Providers | Where-Object { -not $_.Selectable } | ForEach-Object { $_.Name })
     if ($blocked.Count -gt 0) { [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = ('不可通过代理切换: ' + ($blocked -join ' / ')) }) }) }
     [void]$elements.Add(@{ tag = 'hr' })
@@ -142,17 +164,31 @@ function New-ModelsCard($Target, $Models) {
     foreach ($m in @($Models.Configured) + @($Models.Upstream)) {
         if ($m -and (Test-SafeToken $m) -and $seen.Add($m)) { [void]$ordered.Add($m) }
     }
-    $shown = @($ordered | Select-Object -First 32)
-    $buttons = foreach ($m in $shown) {
+    $shown = @($ordered | Select-Object -First 100)
+    $options = foreach ($m in $shown) {
         $isConfigured = $Models.Configured -contains $m
-        switch ($AppType) {
-            'claude' { New-CmdButton $(if ($isConfigured) { "⭐ $m" } else { $m }) "/ccs map $($Target.Id) $m" $(if ($isConfigured) { 'primary' } else { 'default' }) "⏳ 已选 $m" '请在下一张卡片中选择映射到哪个别名。' }
-            'codex'  { New-CmdButton $(if ($isConfigured) { "⭐ $m" } else { $m }) "/ccs map $($Target.Id) $m" $(if ($isConfigured) { 'primary' } else { 'default' }) "⏳ 正在设置 $m…" $null }
-            default  { New-CmdButton $m "/model $($Target.Id)/$m" 'default' "⏳ 切换会话模型 → $($Target.Id)/$m" $null }
+        $text = $(if ($isConfigured) { "⭐ $m" } else { $m })
+        $cmd = switch ($AppType) {
+            'claude' { "/ccs map $($Target.Id) $m" }
+            'codex'  { "/ccs map $($Target.Id) $m" }
+            default  { "/model $($Target.Id)/$m" }
         }
+        @{ Text = $text; Value = $cmd }
     }
-    if ($buttons.Count -eq 0) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '没有可用的模型信息' } }) }
-    Add-ButtonRows $elements $buttons 3
+    if ($options.Count -eq 0) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '没有可用的模型信息' } }) }
+    else {
+        $after = switch ($AppType) {
+            'claude' { "⏳ 已选模型，请在下一张卡片中选择映射别名…" }
+            'codex'  { "⏳ 正在设置上游模型…" }
+            default  { "⏳ 正在切换会话模型…" }
+        }
+        $initial = $null
+        if ($AppType -ne 'claude') {
+            $curModel = $Models.Configured | Select-Object -First 1
+            if ($curModel) { $initial = switch ($AppType) { 'codex' { "/ccs map $($Target.Id) $curModel" } default { "/model $($Target.Id)/$curModel" } } }
+        }
+        [void]$elements.Add((New-SelectRow '选择模型…' $options $initial $after $null))
+    }
     if ($ordered.Count -gt $shown.Count) { [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = "还有 $($ordered.Count - $shown.Count) 个模型未显示，可用 /ccs models $($Target.Name) 查看全部" }) }) }
     if ($Models.UpstreamError) { [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = "上游模型列表不可用: $($Models.UpstreamError)" }) }) }
     New-Card "选择模型 · $($Target.Name)" 'turquoise' $elements
@@ -161,11 +197,12 @@ function New-ModelsCard($Target, $Models) {
 function New-TiersCard($Target, [string]$Model) {
     $elements = New-Object System.Collections.ArrayList
     [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = "**$Model** 映射到哪个别名？`n带 [1m] 的档位会以 **$Model[1M]** 写入；all 表示 haiku/sonnet/opus/fable 全部档位" } })
-    $buttons = foreach ($t in $TierButtons) {
-        $label = if ($t -like 'all*') { $t -replace '^all', '全部档位' } else { $t }
-        New-CmdButton $label "/ccs map $($Target.Id) $Model $t" $(if ($t -like 'sonnet*') { 'primary' } else { 'default' }) "⏳ 正在写入 $label → $Model…" $null
+    $options = foreach ($t in $TierButtons) {
+        $text = if ($t -like 'all*') { $t -replace '^all', '全部档位' } else { $t }
+        @{ Text = $text; Value = "/ccs map $($Target.Id) $Model $t" }
     }
-    Add-ButtonRows $elements $buttons 3
+    $initial = "/ccs map $($Target.Id) $Model sonnet"
+    [void]$elements.Add((New-SelectRow '映射到哪个别名…' $options $initial "⏳ 正在写入映射…" $null))
     New-Card "映射 · $($Target.Name)" 'orange' $elements
 }
 
