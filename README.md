@@ -33,10 +33,11 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 安装脚本会：
 
 1. 把脚本放到 `~/.cc-connect/plugins/ccs`
-2. 给每个带飞书平台的 cc-connect 项目写入 `/ccs` 自定义命令和 `message.received` 钩子（写入前备份 `config.toml`）
+2. 在 `config.toml` **顶层**写入 `[[commands]]` `/ccs` 和 `[[hooks]]` `message.received`（官方 cc-connect 不读 `[[projects.commands]]`）。应用类型在运行时从 `CC_HOOK_PROJECT` 或 exec 工作目录推断
 3. 生成 `~/.cc-switch/control-api.json`（随机令牌，允许全部应用）
+4. 若飞书项目没有 `admin_from`，官方版会拒绝执行 `/ccs` exec（特权命令）。安装脚本会把已有的 `allow_from` 复制过去；都没有则需要你自己加
 
-然后重启 cc-connect（`cc-connect daemon restart`），在飞书发 `/ccs`。
+然后重启 cc-connect，在飞书发 `/ccs`。
 
 ### 热切换：带控制接口的 CC Switch
 
@@ -86,7 +87,7 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 ```
 
 - 钩子只对内容恰好是 `/ccs` 的飞书消息动作，其它消息立即退出
-- 卡片按钮值是 `cmd:/ccs switch <id>`，权限沿用 cc-connect 对该用户的正常命令权限
+- 卡片按钮值是 `cmd:/ccs switch <id>`；官方版把自定义 **exec** 当特权命令，调用者必须在该项目的 `admin_from` 里
 - 飞书凭据直接从 `config.toml` 读取，不另存
 
 ## 安全提示

@@ -1,7 +1,7 @@
 # ccs-plugin shared helpers. Dot-sourced by ccs.ps1, ccs-hook.ps1 and install.ps1.
 Set-StrictMode -Version 2.0
 
-$script:CcsPluginVersion = '0.1.1'
+$script:CcsPluginVersion = '0.1.2'
 
 function Get-CcsPaths {
     $userHome = $env:USERPROFILE
@@ -331,6 +331,48 @@ function ConvertFrom-CcsTomlValue([string]$Raw) {
     return ($v -replace '\s*#.*$', '')
 }
 
+function Get-CcsAppTypeForAgent([string]$AgentType) {
+    switch ($AgentType) {
+        'claudecode' { 'claude' }
+        'codex'      { 'codex' }
+        'gemini'     { 'gemini' }
+        'pi'         { 'pi' }
+        'opencode'   { 'opencode' }
+        default      { '' }
+    }
+}
+
+# Official cc-connect only wires top-level [[commands]] / [[hooks]] (not [[projects.*]]).
+# Infer the CC Switch app from the invoking project (hook env) or the exec cwd.
+function Resolve-CcsAppType {
+    $paths = Get-CcsPaths
+    $projects = @()
+    try { $projects = @(Get-CcsConnectProjects $paths.ConnectConfig) } catch { $projects = @() }
+
+    $name = [string]$env:CC_HOOK_PROJECT
+    if (-not $name) { $name = [string]$env:CC_PROJECT }
+    if ($name) {
+        $p = $projects | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if ($p) {
+            $app = Get-CcsAppTypeForAgent $p.AgentType
+            if ($app) { return $app }
+        }
+    }
+
+    try {
+        $wd = [IO.Path]::GetFullPath((Get-Location).Path).TrimEnd('\', '/')
+        foreach ($p in $projects) {
+            if (-not $p.WorkDir) { continue }
+            $pwd2 = [IO.Path]::GetFullPath($p.WorkDir).TrimEnd('\', '/')
+            if ([string]::Equals($wd, $pwd2, [StringComparison]::OrdinalIgnoreCase)) {
+                $app = Get-CcsAppTypeForAgent $p.AgentType
+                if ($app) { return $app }
+            }
+        }
+    } catch {}
+    return 'claude'
+}
+
 # Returns project descriptors with line ranges so install.ps1 can edit safely.
 function Get-CcsConnectProjects([string]$ConfigPath) {
     if (-not (Test-Path $ConfigPath)) { throw "找不到 cc-connect 配置: $ConfigPath" }
@@ -354,7 +396,7 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
         if ($t -match '^\[\[projects\]\]$') {
             & $closeProject ($i - 1)
             $cur = [pscustomobject]@{
-                Name = ''; AgentType = ''; Feishu = $null; StartLine = $i; EndLine = $lines.Count - 1
+                Name = ''; AgentType = ''; WorkDir = ''; AdminFrom = ''; Feishu = $null; StartLine = $i; EndLine = $lines.Count - 1
                 Commands = (New-Object System.Collections.ArrayList); Hooks = (New-Object System.Collections.ArrayList)
             }
             [void]$projects.Add($cur)
@@ -373,6 +415,7 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
                 '^projects\.platforms$'          { $platform = [pscustomobject]@{ Type = ''; Options = @{} }; $ctx = 'platform' }
                 '^projects\.platforms\.options$' { $ctx = 'platform.options' }
                 '^projects\.agent$'              { $ctx = 'agent' }
+                '^projects\.agent\.options$'     { $ctx = 'agent.options' }
                 '^projects\.commands$'           { $command = [pscustomobject]@{ Name = ''; Exec = ''; StartLine = $i; EndLine = $i }; [void]$cur.Commands.Add($command); $ctx = 'command' }
                 '^projects\.hooks$'              { $hook = [pscustomobject]@{ Event = ''; Command = ''; StartLine = $i; EndLine = $i }; [void]$cur.Hooks.Add($hook); $ctx = 'hook' }
                 default                          { $ctx = 'other' }
@@ -384,8 +427,9 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
         if ($t -match '^([A-Za-z0-9_\-]+)\s*=\s*(.+)$') {
             $k = $Matches[1]; $v = ConvertFrom-CcsTomlValue $Matches[2]
             switch ($ctx) {
-                'project'          { if ($k -eq 'name') { $cur.Name = $v } }
+                'project'          { if ($k -eq 'name') { $cur.Name = $v } elseif ($k -eq 'admin_from') { $cur.AdminFrom = $v } }
                 'agent'            { if ($k -eq 'type') { $cur.AgentType = $v } }
+                'agent.options'    { if ($k -eq 'work_dir') { $cur.WorkDir = $v } }
                 'platform'         { if ($k -eq 'type') { $platform.Type = $v } else { $platform.Options[$k] = $v } }
                 'platform.options' { if ($platform) { $platform.Options[$k] = $v } }
                 'command'          { if ($k -eq 'name') { $command.Name = $v } elseif ($k -eq 'exec') { $command.Exec = $v }; $command.EndLine = $i }
@@ -398,6 +442,56 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
     }
     & $closeProject ($lines.Count - 1)
     return @($projects)
+}
+
+# Official cc-connect only loads top-level [[commands]] / [[hooks]] (not [[projects.*]]).
+function Get-CcsGlobalTables([string]$ConfigPath) {
+    if (-not (Test-Path $ConfigPath)) { throw "找不到 cc-connect 配置: $ConfigPath" }
+    $lines = @(Get-Content $ConfigPath -Encoding UTF8)
+    $commands = New-Object System.Collections.ArrayList
+    $hooks = New-Object System.Collections.ArrayList
+    $cur = $null; $kind = ''
+    $close = {
+        if ($null -ne $script:CcsGlobalCur) {
+            while ($script:CcsGlobalCur.EndLine -gt $script:CcsGlobalCur.StartLine -and [string]::IsNullOrWhiteSpace($lines[$script:CcsGlobalCur.EndLine])) {
+                $script:CcsGlobalCur.EndLine--
+            }
+        }
+    }
+    $script:CcsGlobalCur = $null
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        if ($t -match '^\[\[([A-Za-z0-9_.\-]+)\]\]$') {
+            $name = $Matches[1]
+            & $close
+            $cur = $null; $kind = ''; $script:CcsGlobalCur = $null
+            if ($name -eq 'commands') {
+                $cur = [pscustomobject]@{ Name = ''; Exec = ''; StartLine = $i; EndLine = $i }
+                [void]$commands.Add($cur); $kind = 'command'; $script:CcsGlobalCur = $cur
+            } elseif ($name -eq 'hooks') {
+                $cur = [pscustomobject]@{ Event = ''; Command = ''; StartLine = $i; EndLine = $i }
+                [void]$hooks.Add($cur); $kind = 'hook'; $script:CcsGlobalCur = $cur
+            }
+            continue
+        }
+        if ($t -match '^\[') {
+            & $close
+            $cur = $null; $kind = ''; $script:CcsGlobalCur = $null
+            continue
+        }
+        if ($cur -and $t -match '^([A-Za-z0-9_\-]+)\s*=\s*(.+)$') {
+            $k = $Matches[1]; $v = ConvertFrom-CcsTomlValue $Matches[2]
+            switch ($kind) {
+                'command' { if ($k -eq 'name') { $cur.Name = $v } elseif ($k -eq 'exec') { $cur.Exec = $v } }
+                'hook'    { if ($k -eq 'event') { $cur.Event = $v } elseif ($k -eq 'command') { $cur.Command = $v } }
+            }
+            $cur.EndLine = $i
+        }
+    }
+    & $close
+    Remove-Variable CcsGlobalCur -Scope Script -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Commands = @($commands); Hooks = @($hooks) }
 }
 
 function Get-CcsFeishuCredential([string]$ConfigPath, [string]$ProjectName) {

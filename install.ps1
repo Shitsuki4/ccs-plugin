@@ -122,26 +122,30 @@ function Ensure-ControlApiConfig {
 }
 
 # ---------------------------------------------------------------- config.toml
-function New-CommandBlock([string]$AppType) {
+# Official cc-connect only wires top-level [[commands]] / [[hooks]]. Per-project
+# [[projects.commands]] is ignored (that's why /ccs became "Unknown command"
+# after swapping off the fork). App type is inferred at runtime from
+# CC_HOOK_PROJECT or the exec cwd.
+function New-CommandBlock {
     $shell = Get-ShellExe
-    $exec = "$shell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'ccs.ps1')`" {{args}} -AppType $AppType"
+    $exec = "$shell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'ccs.ps1')`" {{args}}"
     @(
-        '  [[projects.commands]]',
-        '    name = "ccs"',
-        '    description = "切换 CC Switch 供应商 (ccs-plugin)"',
-        "    exec = $(ConvertTo-TomlString $exec)"
+        '[[commands]]',
+        '  name = "ccs"',
+        '  description = "切换 CC Switch 供应商 (ccs-plugin)"',
+        "  exec = $(ConvertTo-TomlString $exec)"
     )
 }
 
-function New-HookBlock([string]$AppType) {
+function New-HookBlock {
     $shell = Get-ShellExe
-    $cmd = "$shell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'ccs-hook.ps1')`" -AppType $AppType"
+    $cmd = "$shell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'ccs-hook.ps1')`""
     @(
-        '  [[projects.hooks]]',
-        '    event = "message.received"',
-        '    type = "command"',
-        "    command = $(ConvertTo-TomlString $cmd)",
-        '    timeout = 30'
+        '[[hooks]]',
+        '  event = "message.received"',
+        '  type = "command"',
+        "  command = $(ConvertTo-TomlString $cmd)",
+        '  timeout = 30'
     )
 }
 
@@ -160,6 +164,45 @@ function Select-TargetProjects($Projects) {
     return $targets
 }
 
+function Get-CcsPluginRanges([string]$Path) {
+    $ranges = New-Object System.Collections.ArrayList
+    foreach ($p in Get-CcsConnectProjects $Path) {
+        foreach ($c in $p.Commands) { if ($c.Name -eq 'ccs' -and $c.Exec -like '*ccs.ps1*') { [void]$ranges.Add(@{ Start = $c.StartLine; End = $c.EndLine }) } }
+        foreach ($h in $p.Hooks) { if ($h.Command -like '*ccs-hook.ps1*') { [void]$ranges.Add(@{ Start = $h.StartLine; End = $h.EndLine }) } }
+    }
+    $g = Get-CcsGlobalTables $Path
+    foreach ($c in $g.Commands) { if ($c.Name -eq 'ccs' -and $c.Exec -like '*ccs.ps1*') { [void]$ranges.Add(@{ Start = $c.StartLine; End = $c.EndLine }) } }
+    foreach ($h in $g.Hooks) { if ($h.Command -like '*ccs-hook.ps1*') { [void]$ranges.Add(@{ Start = $h.StartLine; End = $h.EndLine }) } }
+    return @($ranges)
+}
+
+function Remove-ConfigRanges($Doc, $Ranges) {
+    foreach ($r in ($Ranges | Sort-Object { $_.Start } -Descending)) {
+        $start = $r.Start
+        if ($start -gt 0 -and [string]::IsNullOrWhiteSpace($Doc.Lines[$start - 1])) { $start-- }
+        $count = $r.End - $start + 1
+        if ($count -gt 0) { $Doc.Lines.RemoveRange($start, $count) }
+    }
+}
+
+function Ensure-ProjectAdminFrom($Doc, $Project) {
+    if ($Project.AdminFrom) { return }
+    $allow = $null
+    if ($Project.Feishu -and $Project.Feishu.Options.Contains('allow_from')) { $allow = [string]$Project.Feishu.Options['allow_from'] }
+    if (-not $allow) {
+        Warn "$($Project.Name) 没有 admin_from：官方版把 /ccs exec 当特权命令，未设管理员会拒绝执行。请在该 [[projects]] 下加 admin_from = `"你的飞书 open_id`""
+        return
+    }
+    for ($i = $Project.StartLine; $i -le $Project.EndLine; $i++) {
+        if ($Doc.Lines[$i] -match '^(\s*)name\s*=') {
+            $indent = $Matches[1]
+            $Doc.Lines.Insert($i + 1, ('{0}admin_from = {1}' -f $indent, (ConvertTo-TomlString $allow)))
+            Ok "$($Project.Name) 已写入 admin_from（从 allow_from 复制，/ccs exec 需要管理员）"
+            return
+        }
+    }
+}
+
 function Update-ConnectConfig {
     Step "写入 cc-connect 配置 $ConfigPath"
     if (-not (Test-Path $ConfigPath)) { throw "找不到 $ConfigPath" }
@@ -172,34 +215,30 @@ function Update-ConnectConfig {
     if ($targets.Count -eq 0) { Warn '没有可配置的项目'; return }
 
     $doc = Read-ConfigLines $ConfigPath
-    $edits = New-Object System.Collections.ArrayList
-    foreach ($t in $targets) {
-        $p = $t.Project
-        $existingCmd = $p.Commands | Where-Object { $_.Name -eq 'ccs' } | Select-Object -First 1
-        $existingHook = $p.Hooks | Where-Object { $_.Command -like '*ccs-hook.ps1*' } | Select-Object -First 1
-        if ($existingCmd) { [void]$edits.Add(@{ Start = $existingCmd.StartLine; End = $existingCmd.EndLine; Lines = (New-CommandBlock $t.AppType) }) }
-        else { [void]$edits.Add(@{ Start = $p.EndLine + 1; End = $p.EndLine; Lines = (@('') + (New-CommandBlock $t.AppType)) }) }
-        if ($existingHook) { [void]$edits.Add(@{ Start = $existingHook.StartLine; End = $existingHook.EndLine; Lines = (New-HookBlock $t.AppType) }) }
-        else { [void]$edits.Add(@{ Start = $p.EndLine + 1; End = $p.EndLine; Lines = (@('') + (New-HookBlock $t.AppType)) }) }
-        Ok "$($p.Name) → /ccs (-AppType $($t.AppType))$(if ($existingCmd) { '（更新已有命令）' })"
-    }
-
-    # Apply bottom-up so earlier line numbers stay valid. Insertions at the same point keep their order.
-    $ordered = $edits | Sort-Object -Property @{ Expression = 'Start'; Descending = $true }, @{ Expression = { $edits.IndexOf($_) }; Descending = $true }
-    foreach ($e in $ordered) {
-        $count = $e.End - $e.Start + 1
-        if ($count -gt 0) { $doc.Lines.RemoveRange($e.Start, $count) }
-        $doc.Lines.InsertRange($e.Start, [string[]]$e.Lines)
-    }
+    foreach ($t in ($targets | Sort-Object { $_.Project.StartLine } -Descending)) { Ensure-ProjectAdminFrom $doc $t.Project }
     Write-ConfigLines $ConfigPath $doc
 
-    $check = Get-CcsConnectProjects $ConfigPath
-    foreach ($t in $targets) {
-        $p = $check | Where-Object { $_.Name -eq $t.Project.Name }
-        $ok = ($p.Commands | Where-Object { $_.Name -eq 'ccs' -and $_.Exec -like '*ccs.ps1*' }) -and ($p.Hooks | Where-Object { $_.Command -like '*ccs-hook.ps1*' })
-        if (-not $ok) { throw "写入后校验失败（项目 $($t.Project.Name)），已保留备份 $backup" }
+    $doc = Read-ConfigLines $ConfigPath
+    Remove-ConfigRanges $doc (Get-CcsPluginRanges $ConfigPath)
+    $tail = New-Object System.Collections.ArrayList
+    if ($doc.Lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($doc.Lines[$doc.Lines.Count - 1])) { [void]$tail.Add('') }
+    [void]$tail.Add('')
+    foreach ($line in (New-CommandBlock)) { [void]$tail.Add($line) }
+    [void]$tail.Add('')
+    foreach ($line in (New-HookBlock)) { [void]$tail.Add($line) }
+    $doc.Lines.AddRange([string[]]@($tail))
+    Write-ConfigLines $ConfigPath $doc
+
+    $g = Get-CcsGlobalTables $ConfigPath
+    $cmdOk = $g.Commands | Where-Object { $_.Name -eq 'ccs' -and $_.Exec -like '*ccs.ps1*' } | Select-Object -First 1
+    $hookOk = $g.Hooks | Where-Object { $_.Command -like '*ccs-hook.ps1*' } | Select-Object -First 1
+    if (-not $cmdOk -or -not $hookOk) { throw "写入后校验失败（全局 [[commands]]/[[hooks]]），已保留备份 $backup" }
+    $leftover = @()
+    foreach ($p in Get-CcsConnectProjects $ConfigPath) {
+        foreach ($c in $p.Commands) { if ($c.Name -eq 'ccs') { $leftover += $p.Name } }
     }
-    Ok '配置校验通过'
+    if ($leftover.Count -gt 0) { Warn "仍有项目级 [[projects.commands]] ccs（官方版会忽略）: $($leftover -join ', ')" }
+    Ok "已写入全局 /ccs 命令和 message.received 钩子（覆盖 $($targets.Count) 个飞书项目）"
 }
 
 function Remove-ConnectConfig {
@@ -208,16 +247,8 @@ function Remove-ConnectConfig {
     $backup = "$ConfigPath.ccs-bak-$(Get-Date -Format yyyyMMddHHmmss)"
     Copy-Item $ConfigPath $backup -Force
     $doc = Read-ConfigLines $ConfigPath
-    $ranges = New-Object System.Collections.ArrayList
-    foreach ($p in Get-CcsConnectProjects $ConfigPath) {
-        foreach ($c in $p.Commands) { if ($c.Name -eq 'ccs' -and $c.Exec -like '*ccs.ps1*') { [void]$ranges.Add(@{ Start = $c.StartLine; End = $c.EndLine }) } }
-        foreach ($h in $p.Hooks) { if ($h.Command -like '*ccs-hook.ps1*') { [void]$ranges.Add(@{ Start = $h.StartLine; End = $h.EndLine }) } }
-    }
-    foreach ($r in ($ranges | Sort-Object { $_.Start } -Descending)) {
-        $start = $r.Start
-        if ($start -gt 0 -and [string]::IsNullOrWhiteSpace($doc.Lines[$start - 1])) { $start-- }
-        $doc.Lines.RemoveRange($start, $r.End - $start + 1)
-    }
+    $ranges = @(Get-CcsPluginRanges $ConfigPath)
+    Remove-ConfigRanges $doc $ranges
     Write-ConfigLines $ConfigPath $doc
     Ok "已移除 $($ranges.Count) 个配置块（备份 $backup）"
 }

@@ -10,7 +10,7 @@
 param(
     [Parameter(Position = 0)][string]$Action = 'list',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest = @(),
-    [ValidatePattern('^[a-z\-]+$')][string]$AppType = 'claude',
+    [ValidatePattern('^[a-z\-]+$')][string]$AppType = '',
     [switch]$NoCardHint
 )
 
@@ -18,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 . (Join-Path $PSScriptRoot 'ccs-common.ps1')
+if (-not $AppType) { $AppType = Resolve-CcsAppType }
 
 $TierUsage = 'sonnet | sonnet[1m] | opus | opus[1m] | haiku | fable | fable[1m] | all | all[1m]'
 

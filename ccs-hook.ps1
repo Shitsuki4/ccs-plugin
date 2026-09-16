@@ -10,7 +10,7 @@
 # from the clicking user; ccs.ps1 does the actual work.
 [CmdletBinding()]
 param(
-    [ValidatePattern('^[a-z\-]+$')][string]$AppType = 'claude',
+    [ValidatePattern('^[a-z\-]+$')][string]$AppType = '',
     [string]$ConfigPath = ''
 )
 
@@ -35,6 +35,7 @@ $step = switch -Regex ($sub) {
 if (-not $step) { exit 0 }
 
 . (Join-Path $PSScriptRoot 'ccs-common.ps1')
+if (-not $AppType) { $AppType = Resolve-CcsAppType }
 $paths = Get-CcsPaths
 if (-not $ConfigPath) { $ConfigPath = $paths.ConnectConfig }
 New-Item -ItemType Directory -Force $paths.StateDir | Out-Null
