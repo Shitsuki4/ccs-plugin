@@ -1,0 +1,3 @@
+# local state
+*.ccs-bak-*
+__pycache__/

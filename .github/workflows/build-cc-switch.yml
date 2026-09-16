@@ -1,0 +1,152 @@
+name: build-cc-switch
+
+# Builds the official cc-switch tag with the ccs-plugin control API patch applied
+# and publishes cc-switch.exe (Windows x64) as a GitHub Release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream cc-switch tag (e.g. v3.20.3). Leave empty for the latest release."
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-cc-switch
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(gh api repos/farion1231/cc-switch/releases/latest --jq .tag_name)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "cc-switch-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release cc-switch-$tag already exists, skipping"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: windows-2022
+    steps:
+      - name: Checkout ccs-plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout cc-switch ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: farion1231/cc-switch
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: cc-switch
+
+      - name: Apply control API patch
+        shell: pwsh
+        run: python plugin/patches/apply.py cc-switch --updater-endpoint "https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        shell: pwsh
+        working-directory: cc-switch
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cc-switch/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ needs.resolve.outputs.tag }}-${{ hashFiles('cc-switch/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install frontend deps
+        shell: pwsh
+        working-directory: cc-switch
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (no bundle, no updater signing)
+        shell: pwsh
+        working-directory: cc-switch
+        run: pnpm tauri build --no-bundle
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $exe = "cc-switch/src-tauri/target/release/cc-switch.exe"
+          if (-not (Test-Path $exe)) { throw "build output missing: $exe" }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $text.Contains("Provider control API")) { throw "control API marker not found in binary" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $exe out/cc-switch-windows-x64.exe
+          $hash = (Get-FileHash out/cc-switch-windows-x64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  cc-switch-windows-x64.exe" | Set-Content out/SHA256SUMS -Encoding ascii
+          "upstream=${{ needs.resolve.outputs.tag }}" | Set-Content out/BUILD_INFO
+          "plugin_commit=${{ github.sha }}" | Add-Content out/BUILD_INFO
+          # Same version as the app itself, so the in-app updater reports "up to date"
+          # instead of offering the unpatched official build.
+          $version = "${{ needs.resolve.outputs.tag }}".TrimStart("v")
+          $latest = @{
+            version   = $version
+            notes     = "cc-switch $version with ccs-plugin control API"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{ "windows-x86_64" = @{ signature = ""; url = "https://github.com/${{ github.repository }}/releases/download/cc-switch-${{ needs.resolve.outputs.tag }}/cc-switch-windows-x64.exe" } }
+          }
+          $latest | ConvertTo-Json -Depth 5 | Set-Content out/latest.json -Encoding utf8
+          Get-ChildItem out
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cc-switch-${{ needs.resolve.outputs.tag }}
+          name: cc-switch ${{ needs.resolve.outputs.tag }} + control API
+          body: |
+            Official [cc-switch ${{ needs.resolve.outputs.tag }}](https://github.com/farion1231/cc-switch/releases/tag/${{ needs.resolve.outputs.tag }})
+            rebuilt with the ccs-plugin provider control API (`127.0.0.1:15722`).
+
+            Install/update: `install.ps1 -InstallCcSwitch` or copy `cc-switch-windows-x64.exe` over
+            `%LOCALAPPDATA%\Programs\CC Switch\cc-switch.exe` while CC Switch is closed.
+
+            Not signed. Built from `patches/control_api.rs` at `${{ github.sha }}`.
+          files: |
+            out/cc-switch-windows-x64.exe
+            out/SHA256SUMS
+            out/BUILD_INFO
+            out/latest.json
