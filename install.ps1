@@ -266,6 +266,38 @@ function Install-PatchedCcSwitch {
 }
 
 # ---------------------------------------------------------------- cc-connect
+function Get-CcConnectExePath {
+    # Never use Get-Command: PATH often hits an npm/corepack shim (cc-connect.ps1 / .cmd)
+    # ahead of the real binary. Overwriting the shim turns it into a 50MB MZ that pwsh
+    # then tries to parse as a script, and the running ~/.cc-connect/cc-connect.exe is left
+    # untouched. Prefer the live process path, else the well-known install location.
+    $homeExe = Join-Path $env:USERPROFILE '.cc-connect\cc-connect.exe'
+    $proc = Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if ($proc) { return $proc.Path }
+    return $homeExe
+}
+
+function Wait-CcConnectGone([int]$Seconds = 15) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Milliseconds 300
+    }
+    return -not [bool](Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue)
+}
+
+function Get-CcConnectDaemonParent {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -match '^(powershell|pwsh)\.exe$') -and
+            $_.CommandLine -and
+            ($_.CommandLine -like '*cc-connect-daemon.ps1*')
+        } |
+        Select-Object -First 1
+}
+
 function Install-OfficialCcConnect {
     Step '替换为官方 cc-connect'
     $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/chenhg5/cc-connect/releases/latest' -Headers @{ 'User-Agent' = 'ccs-plugin' }
@@ -274,9 +306,12 @@ function Install-OfficialCcConnect {
     if (-not $asset) { throw "官方 Release $($rel.tag_name) 没有 windows-$arch 资产" }
     Note "版本: $($rel.tag_name)"
 
-    $cmd = Get-Command cc-connect -ErrorAction SilentlyContinue
-    $target = if ($cmd) { $cmd.Source } else { Join-Path $env:USERPROFILE '.cc-connect\cc-connect.exe' }
+    $target = Get-CcConnectExePath
+    if (-not $target.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "拒绝覆盖非 exe 路径（多半是 npm shim）: $target"
+    }
     if (-not (Test-Path $target)) { throw "找不到 cc-connect.exe（$target）" }
+    Note "目标: $target"
 
     $tmp = Join-Path $env:TEMP "ccs-plugin-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force $tmp | Out-Null
@@ -286,18 +321,36 @@ function Install-OfficialCcConnect {
     $newExe = Get-ChildItem $tmp -Recurse -Filter 'cc-connect*.exe' | Select-Object -First 1
     if (-not $newExe) { throw '压缩包中没有 cc-connect.exe' }
 
-    $statusOut = & $target daemon status 2>&1
-    $isDaemon = ($LASTEXITCODE -eq 0) -and (($statusOut | Out-String) -match 'running|active|installed')
+    $daemon = Get-CcConnectDaemonParent
     Warn '正在停止 cc-connect（所有聊天会话会断开，稍后自动恢复）'
-    if ($isDaemon) { & $target daemon stop 2>&1 | Out-Null }
+    # Do not call `daemon stop`/`daemon start`: official `daemon install` would rewrite
+    # the scheduled task and drop the custom daemon.ps1 PATH snapshot. Kill only the
+    # child exe and let daemon.ps1's while-loop relaunch the new binary.
     Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 2
+    if (-not (Wait-CcConnectGone 20)) { throw '无法结束 cc-connect.exe' }
+
     Copy-Item $target "$target.ccs-bak-$(Get-Date -Format yyyyMMddHHmmss)" -Force
     Copy-Item $newExe.FullName $target -Force
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    if ($isDaemon) { & $target daemon start 2>&1 | Out-Null; Ok '已通过 daemon 重新启动' }
-    else { Start-Process -FilePath $target -WorkingDirectory (Split-Path $target) -WindowStyle Hidden | Out-Null; Ok '已重新启动 cc-connect 进程' }
-    Note ((& $target --version 2>&1 | Out-String).Trim())
+
+    if ($daemon) {
+        $wait = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $wait -and -not (Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 400
+        }
+        if (Get-Process -Name 'cc-connect' -ErrorAction SilentlyContinue) { Ok '已替换，守护脚本已拉起新进程' }
+        else { Warn '守护脚本尚未拉起；若 10 秒后仍没有进程，请手动 schtasks /run /tn cc-connect' }
+    } elseif (Get-ScheduledTask -TaskName 'cc-connect' -ErrorAction SilentlyContinue) {
+        Start-ScheduledTask -TaskName 'cc-connect'
+        Ok '已通过计划任务重新启动'
+    } else {
+        Start-Process -FilePath $target -WorkingDirectory (Split-Path $target) -WindowStyle Hidden | Out-Null
+        Ok '已重新启动 cc-connect 进程'
+    }
+
+    $ver = (& $target --version 2>&1 | Out-String).Trim()
+    if ($ver -match 'ccs-picker') { throw "替换后仍是 fork 版本:`n$ver" }
+    Note $ver
 }
 
 # ---------------------------------------------------------------- main

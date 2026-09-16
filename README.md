@@ -71,7 +71,7 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 |---|---|
 | `-Project a,b` | 只配置指定项目 |
 | `-InstallCcSwitch` | 安装/更新补丁版 CC Switch |
-| `-InstallOfficialCcConnect` | 用官方最新 Release 替换 cc-connect.exe（会重启，所有会话短暂断开） |
+| `-InstallOfficialCcConnect` | 用官方最新 Release 替换 `~\.cc-connect\cc-connect.exe`（会重启，所有会话短暂断开）。**不会**走 PATH / `Get-Command`，避免覆盖 npm shim |
 | `-Source <dir>` | 从本地目录安装而不是下载 |
 | `-Uninstall` | 移除配置块和脚本 |
 
