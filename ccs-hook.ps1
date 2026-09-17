@@ -26,16 +26,12 @@ if ($content -notmatch '^/(ccs|cc-switch)(\s|$)') { exit 0 }
 
 $tokens = @($content -split '\s+' | Where-Object { $_ })
 $sub = if ($tokens.Count -ge 2) { $tokens[1].ToLower() } else { 'list' }
-# /ccs map <id> <model> [tier] — tier may be quoted or contain [1m]; keep raw tail intact
 $args2 = @($tokens | Select-Object -Skip 2)
 $step = switch -Regex ($sub) {
-    '^(list|ls|menu|card|cascade)$'        { 'cascade' }
-    '^(pick)$'                             { 'pick' }
-    '^(apply)$'                            { 'apply' }
-    '^(pickers)$'                          { 'providers' }
-    '^(switch|use|select|set|to)$'         { if ($args2.Count -eq 1) { 'models' } }
-    '^(models|model-list|catalog)$'        { if ($args2.Count -eq 1) { 'models' } }
-    '^map$'                                { if ($args2.Count -eq 2) { 'tiers' } elseif ($args2.Count -eq 3) { 'applied' } }
+    '^(list|ls|pick|menu|card)$'          { 'providers' }
+    '^(switch|use|select|set|to)$'        { if ($args2.Count -eq 1) { 'models' } }
+    '^(models|model-list|catalog)$'       { if ($args2.Count -eq 1) { 'models' } }
+    '^map$'                               { if ($args2.Count -eq 2) { 'tiers' } elseif ($args2.Count -eq 3) { 'applied' } }
 }
 if (-not $step) { exit 0 }
 
@@ -77,46 +73,6 @@ function Send-FeishuMessage([string]$Token, [string]$Domain, [string]$ChatId, [s
         -Headers @{ Authorization = "Bearer $Token" } -ContentType 'application/json; charset=utf-8' `
         -Body ([System.Text.Encoding]::UTF8.GetBytes($msg)) -TimeoutSec 15
     if ($r.code -ne 0) { throw "发送消息失败: $($r.code) $($r.msg)" }
-    try { return [string]$r.data.message_id } catch { return $null }
-}
-
-function Update-FeishuCard([string]$Token, [string]$Domain, [string]$MessageId, $Card) {
-    $body = @{ content = ($Card | ConvertTo-Json -Depth 12 -Compress) } | ConvertTo-Json -Compress
-    $r = Invoke-RestMethod -Method Patch -Uri "$Domain/open-apis/im/v1/messages/$MessageId" `
-        -Headers @{ Authorization = "Bearer $Token" } -ContentType 'application/json; charset=utf-8' `
-        -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 15
-    if ($r.code -ne 0) { throw "更新卡片失败: $($r.code) $($r.msg)" }
-}
-
-# Card state per session: remembers which message holds the current /ccs card so the
-# next step can patch it in place (cascader-style progressive reveal on one card).
-function Get-CcsCardStatePath([string]$SessionKey) {
-    $sha = [System.Security.Cryptography.SHA1]::Create()
-    $hex = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($SessionKey)))).Replace('-', '').Substring(0, 16).ToLower()
-    Join-Path $paths.StateDir "card-$hex.json"
-}
-function Save-CcsCardState([string]$SessionKey, $State) {
-    $obj = [ordered]@{
-        message_id  = [string]$State.message_id
-        provider_id = [string]$State.provider_id
-        model       = [string]$State.model
-        tier        = [string]$State.tier
-        at          = (Get-Date).ToString('o')
-    }
-    [System.IO.File]::WriteAllText((Get-CcsCardStatePath $SessionKey), ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding $false))
-}
-function Get-CcsCardState([string]$SessionKey) {
-    $p = Get-CcsCardStatePath $SessionKey
-    if (-not (Test-Path $p)) { return $null }
-    try {
-        $o = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
-        return @{
-            message_id  = [string]$o.message_id
-            provider_id = [string]$o.provider_id
-            model       = [string]$o.model
-            tier        = [string]$o.tier
-        }
-    } catch { return $null }
 }
 
 # ---- card building blocks ----
@@ -258,94 +214,6 @@ function New-AppliedCard($Target, [string]$Model, $TierSpec) {
     New-Card "应用到会话 · $($TierSpec.Alias)" 'green' $elements
 }
 
-# ---- single-card cascader ----
-# One card holds up to three select_static dropdowns: provider -> model -> alias tier.
-# Each pick re-renders and PATCHes the same message in place; the final pick applies.
-
-function ConvertTo-CcsPickerCommand([string]$Kind, [string]$Value) {
-    "/ccs pick $Kind '$Value'"
-}
-
-function New-CascadeCard([string]$AppType, $Catalog, $Models, [hashtable]$Sel, [string]$StatusText, [string]$StatusColor) {
-    # fill missing keys so StrictMode property access never throws
-    foreach ($k in @('provider_id', 'model', 'tier')) { if (-not $Sel.ContainsKey($k)) { $Sel[$k] = '' } }
-    $elements = New-Object System.Collections.ArrayList
-
-    # status line
-    $line = ''
-    if ($Sel.provider_id) {
-        $pv = $Catalog.Providers | Where-Object { $_.Id -eq $Sel.provider_id } | Select-Object -First 1
-        if ($pv) { $line = "**$($pv.Name)**" + $(if ($pv.Model) { " · $($pv.Model)" }) }
-    }
-    if ($line -and $Sel.model) { $line += " · **$($Sel.model)**" }
-    elseif ($Sel.model) { $line = "**$($Sel.model)**" }
-    if ($line -and $Sel.tier) { $line += " → **$($Sel.tier)**" }
-    if (-not $line) { $line = '未选择' }
-    $head = if ($StatusText) { "$StatusText`n当前选择：$line" } else { "当前选择：$line" }
-    [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = $head } })
-    if ($Catalog.ProxyManaged -and -not $Catalog.ProxyRunning) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '⚠️ 本地代理未运行，切换不会生效' } }) }
-
-    # 1. provider dropdown
-    $pOpts = foreach ($p in ($Catalog.Providers | Where-Object { $_.Selectable })) {
-        $text = $p.Name
-        if ($p.Model) { $text += " · $($p.Model)" }
-        if ($p.Current) { $text = "✅ $text" }
-        @{ Text = $text; Value = (ConvertTo-CcsPickerCommand 'provider' $p.Id) }
-    }
-    $pInit = if ($Sel.provider_id) { ConvertTo-CcsPickerCommand 'provider' $Sel.provider_id } else { $null }
-    [void]$elements.Add((New-SelectRow '① 选择供应商…' $pOpts $pInit "⏳ 已选供应商，正在加载模型…" $null))
-
-    # 2. model dropdown (only once a provider is picked)
-    if ($Sel.provider_id -and $Models) {
-        $seen = New-Object System.Collections.Generic.HashSet[string]
-        $ordered = New-Object System.Collections.ArrayList
-        foreach ($m in @($Models.Configured) + @($Models.Upstream)) {
-            if ($m -and (Test-SafeToken $m) -and $seen.Add($m)) { [void]$ordered.Add($m) }
-        }
-        $shown = @($ordered | Select-Object -First 100)
-        $mOpts = foreach ($m in $shown) {
-            $isCfg = $Models.Configured -contains $m
-            @{ Text = $(if ($isCfg) { "⭐ $m" } else { $m }); Value = (ConvertTo-CcsPickerCommand 'model' $m) }
-        }
-        $mInit = if ($Sel.model) { ConvertTo-CcsPickerCommand 'model' $Sel.model } else { $null }
-        [void]$elements.Add((New-SelectRow '② 选择模型…' $mOpts $mInit "⏳ 已选模型，选择映射别名…" $null))
-        if ($ordered.Count -gt $shown.Count) {
-            [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = "还有 $($ordered.Count - $shown.Count) 个模型未列出" }) })
-        }
-        if ($Models.UpstreamError) {
-            [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = "上游模型列表不可用: $($Models.UpstreamError)" }) })
-        }
-    }
-
-    # 3. tier dropdown (claude only; codex needs no tier)
-    if ($AppType -eq 'claude' -and $Sel.model) {
-        $tOpts = foreach ($t in $TierButtons) {
-            $text = if ($t -like 'all*') { $t -replace '^all', '全部档位' } else { $t }
-            @{ Text = $text; Value = (ConvertTo-CcsPickerCommand 'tier' $t) }
-        }
-        $tInit = if ($Sel.tier) { ConvertTo-CcsPickerCommand 'tier' $Sel.tier } else { $null }
-        [void]$elements.Add((New-SelectRow '③ 映射到哪个别名…' $tOpts $tInit "⏳ 正在写入映射…" $null))
-    }
-
-    # confirm button appears once everything needed is picked
-    $ready = $Sel.provider_id -and $Sel.model -and ($AppType -ne 'claude' -or $Sel.tier)
-    if ($ready) {
-        $applyCmd = "/ccs apply $($Sel.provider_id) '$($Sel.model)' $(if ($AppType -eq 'claude') { $Sel.tier })"
-        [void]$elements.Add(@{
-            tag     = 'action'
-            actions = @((New-CmdButton '✍️ 写入' $applyCmd 'primary' "⏳ 正在写入 $($Sel.model)$(if ($AppType -eq 'claude') { " → $($Sel.tier)" })…" '结果稍后以消息回复。'))
-        })
-    }
-
-    $template = 'blue'
-    if ($StatusColor) { $template = $StatusColor }
-    elseif ($ready) { $template = 'green' }
-    elseif ($Sel.model) { $template = 'turquoise' }
-    elseif ($Sel.provider_id) { $template = 'purple' }
-    $title = "CC Switch 配置 · $AppType"
-    New-Card $title $template $elements
-}
-
 # ---- main ----
 
 $markerTouched = $false
@@ -357,111 +225,7 @@ try {
     $cred = Get-CcsFeishuCredential $ConfigPath $project
 
     $card = $null
-    $patchMessageId = $null
     switch ($step) {
-        'cascade' {
-            # fresh single-card cascader
-            $catalog = Get-CcsCatalog $AppType
-            if ($catalog.Providers.Count -eq 0) { throw "CC Switch 中没有 $AppType 供应商" }
-            $card = New-CascadeCard $AppType $catalog $null @{} $null $null
-        }
-        'pick' {
-            # dropdown callback: /ccs-pick provider '<id>' | model '<m>' | tier '<t>'
-            if ($args2.Count -lt 2) { exit 0 }
-            $kind = $args2[0].ToLower()
-            $raw = $args2[1..($args2.Count - 1)] -join ' '
-            $val = $raw.Trim("'`u{2018}`u{2019}`u{201C}`u{201D}".ToCharArray()).Trim()
-            if (-not $val -or $kind -notin @('provider', 'model', 'tier')) { exit 0 }
-            if ($kind -ne 'provider' -and -not (Test-SafeToken $val)) { exit 0 }
-
-            $state = Get-CcsCardState $sessionKey
-            if (-not $state -or -not $state.message_id) { Write-HookLog "pick: no card state, ignoring pick $kind"; exit 0 }
-            $patchMessageId = $state.message_id
-
-            $catalog = Get-CcsCatalog $AppType
-            if ($catalog.Providers.Count -eq 0) { throw "CC Switch 中没有 $AppType 供应商" }
-
-            $sel = @{ provider_id = $state.provider_id; model = $state.model; tier = $state.tier }
-            switch ($kind) {
-                'provider' {
-                    $t = Resolve-CcsProvider $catalog.Providers $val
-                    if (-not $t -or -not $t.Selectable) { Write-HookLog "pick: provider '$val' not found/unselectable"; exit 0 }
-                    $sel = @{ provider_id = $t.Id; model = ''; tier = '' }
-                }
-                'model'  { if (-not $sel.provider_id) { exit 0 }; $sel.model = $val; $sel.tier = '' }
-                'tier'   { if (-not $sel.model) { exit 0 }; $sel.tier = $val }
-            }
-            Save-CcsCardState $sessionKey @{
-                message_id  = $patchMessageId
-                provider_id = $sel.provider_id
-                model       = $sel.model
-                tier        = $sel.tier
-            }
-
-            $models = $null
-            if ($sel.provider_id) {
-                $t = $catalog.Providers | Where-Object { $_.Id -eq $sel.provider_id } | Select-Object -First 1
-                if ($t) { $models = Get-CcsProviderModels $AppType $t.Id }
-            }
-            $status = "已记录选择（第 $($tokens.Count) 项：$kind）"
-            $card = New-CascadeCard $AppType $catalog $models $sel $status $null
-            Write-HookLog "card=pick kind=$kind val='$val' provider=$($sel.provider_id) model=$($sel.model) tier=$($sel.tier)"
-        }
-        'apply' {
-            # executed only via the card's 写入 button (cmd:/ccs apply ...); the
-            # marker makes ccs.ps1 print the hint while the hook does the real work
-            if ($args2.Count -lt 2) { exit 0 }
-            $provId = $args2[0]
-            if (-not (Test-CcsIdentifier $provId)) { exit 0 }
-            $state = Get-CcsCardState $sessionKey
-            $rest = @($args2 | Select-Object -Skip 1)
-            $model = $rest[0].Trim("'".ToCharArray())
-            if (-not (Test-SafeToken $model)) { exit 0 }
-            $tier = if ($AppType -eq 'claude' -and $rest.Count -ge 2) { $rest[-1] } else { $null }
-
-            $catalog = Get-CcsCatalog $AppType
-            $target = $catalog.Providers | Where-Object { $_.Id -eq $provId } | Select-Object -First 1
-            if (-not $target) { exit 0 }
-
-            # 1. switch provider if not current
-            $applied = New-Object System.Collections.ArrayList
-            if (-not $target.Current) {
-                $mode = Select-CcsProvider $AppType $target.Id
-                [void]$applied.Add("切换供应商 → **$($target.Name)**（$mode）")
-            }
-            # 2. write model mapping
-            $tierSpec = $null
-            if ($AppType -eq 'claude') {
-                $tierSpec = if ($tier) { ConvertTo-CcsTierSpec $tier } else { ConvertTo-CcsTierSpec 'all' }
-                $value = if ($tierSpec.OneM) { Add-CcsOneMSuffix $model } else { $model }
-                Set-CcsProviderModel $AppType $target.Id $value $tierSpec.Tiers
-                $scope = if ($tierSpec.Alias) { $tierSpec.Alias } elseif ($tierSpec.Tiers.Count -gt 0) { $tierSpec.Tiers -join ',' } else { '全部档位' }
-                [void]$applied.Add("$scope → **$value**")
-            } elseif ($AppType -eq 'codex') {
-                Set-CcsProviderModel $AppType $target.Id $model
-                [void]$applied.Add("上游模型 → **$model**")
-            } else {
-                # direct apps (pi etc.): the session model is picked via the /model builtin
-                [void]$applied.Add("模型 → **$model**（点下方按钮切换会话模型）")
-            }
-
-            $suffix = if ($target.Current) { '下一次请求即生效' } else { '切换已提交，生效于下次请求' }
-            $elements = New-Object System.Collections.ArrayList
-            [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = "**$($target.Name)**：$($applied -join '，')`n$suffix" } })
-            $switchModelBtn = $null
-            if ($AppType -eq 'claude' -and $tierSpec.Alias) {
-                $switchModelBtn = New-CmdButton "切到 /model $($tierSpec.Alias)" "/model $($tierSpec.Alias)" 'primary' "✅ 已发送 /model $($tierSpec.Alias)" $null
-            } elseif ($AppType -notin @('claude', 'codex')) {
-                $switchModelBtn = New-CmdButton "切到 /model $($target.Id)/$model" "/model $($target.Id)/$model" 'primary' "✅ 已发送 /model" $null
-            }
-            $againBtn = New-CmdButton '再配一个' '/ccs' 'default' $null $null
-            $btns = @($againBtn); if ($switchModelBtn) { $btns = @($switchModelBtn, $againBtn) }
-            Add-ButtonRows $elements $btns 2
-            $card = New-Card '✅ 已写入' 'green' $elements
-            # clear state so the next /ccs starts fresh
-            Save-CcsCardState $sessionKey @{ message_id = ''; provider_id = ''; model = ''; tier = '' }
-            Write-HookLog "card=apply provider=$($target.Id) model=$model tier=$tier"
-        }
         'providers' {
             $catalog = Get-CcsCatalog $AppType
             if ($catalog.Providers.Count -eq 0) { throw "CC Switch 中没有 $AppType 供应商" }
@@ -500,15 +264,7 @@ try {
     # Touch the marker so ccs.ps1 (running concurrently) prints a hint instead of a duplicate list.
     [System.IO.File]::WriteAllText($paths.CardMarker, (Get-Date).ToString('o'))
     $markerTouched = $true
-    if ($step -eq 'pick' -and $patchMessageId) {
-        # cascade step: patch the existing card in place, no new message
-        Update-FeishuCard $token $cred.Domain $patchMessageId $card
-    } else {
-        $msgId = Send-FeishuMessage $token $cred.Domain $chatId 'interactive' ($card | ConvertTo-Json -Depth 12 -Compress)
-        if ($step -eq 'cascade' -and $msgId) {
-            Save-CcsCardState $sessionKey @{ message_id = $msgId; provider_id = ''; model = ''; tier = '' }
-        }
-    }
+    Send-FeishuMessage $token $cred.Domain $chatId 'interactive' ($card | ConvertTo-Json -Depth 12 -Compress)
     Write-HookLog "card=$step project=$project app=$AppType chat=$chatId content='$content'"
 } catch {
     Write-HookLog "ERROR step=$step project=$project app=$AppType session=$sessionKey : $($_.Exception.Message)"

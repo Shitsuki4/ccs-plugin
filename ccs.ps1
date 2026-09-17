@@ -162,16 +162,6 @@ try {
             else { Write-Output "模式: $modeText" }
         }
         '^(help|-h|--help|\?)$' { Write-Output (Show-Help) }
-        '^(pick|apply)$' {
-            # Card-callback commands: the hook (ccs-hook.ps1) does the real work,
-            # including patching the card in place. The engine would print "(no
-            # output)" for empty results, so emit a one-line acknowledgement.
-            $q = ($rest -join ' ').Trim()
-            switch ($Action.ToLower()) {
-                'pick'  { Write-Output "📋 $q（卡片已更新）" }
-                'apply' { Write-Output '✍️ 正在写入…（结果见卡片/下方消息）' }
-            }
-        }
         default { Write-Output "未知子命令 '$Action'"; Write-Output (Show-Help); exit 1 }
     }
 } catch {
