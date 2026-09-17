@@ -1,7 +1,9 @@
 # /ccs — switch CC Switch providers (and model mappings) from chat.
 # Registered in cc-connect as a custom exec command; ccs-hook.ps1 adds the Feishu cards.
 #
-#   ccs.ps1 [list]                              providers
+#   ccs.ps1 [list]                              providers (Feishu: one card with 3 dropdowns)
+#   ccs.ps1 pick p|m|t <value>                  card-side selection ack (hook PATCHes the card)
+#   ccs.ps1 apply <target> <model> [<tier>]     switch + map in one shot
 #   ccs.ps1 switch <target>                     switch provider (Pi: enable provider)
 #   ccs.ps1 models <target>                     models the provider offers
 #   ccs.ps1 map <target> <model> [<tier>]       claude: map tier(s) -> model; codex: set upstream model
@@ -39,11 +41,12 @@ function Wait-CcsCardMarker {
 
 function Show-Help {
     @"
-/ccs                          列出供应商（飞书会收到可点击的卡片）
+/ccs                          一张卡同时选供应商 / 模型 / 别名，点写入生效
 /ccs switch <序号|名称>        切换供应商
 /ccs models <名称>             查看该供应商可用的模型
 /ccs map <名称> <模型> [档位]   Claude: 把档位映射到该模型（档位: $TierUsage，默认 all）
                               Codex: 设置该供应商的上游模型
+/ccs apply <名称> <模型> [档位] 切换供应商并写入映射
 /ccs status                   当前供应商与模式
 ccs-plugin v$script:CcsPluginVersion · 应用: $AppType
 "@
@@ -80,14 +83,57 @@ function Format-ModelList($Target, $Models) {
 try {
     $rest = @($Rest | Where-Object { $_ -ne $null -and $_ -ne '' })
     switch -Regex ($Action.ToLower()) {
-        '^(list|ls|pick|menu|card|)$' {
+        '^(list|ls|menu|card|cascade|)$' {
             if (Wait-CcsCardMarker) {
-                Write-Output '👆 已发送选择卡片，点击即可切换（或 /ccs switch <序号|名称>）'
+                Write-Output '👆 已发送选择卡片：三个下拉同时可选，点 ✍️ 写入才生效'
                 break
             }
             $catalog = Get-CcsCatalog $AppType
             if ($catalog.Providers.Count -eq 0) { Write-Output "CC Switch 中没有 $AppType 供应商"; break }
             Write-Output (Format-CcsCatalog $catalog $AppType)
+        }
+        '^(pick)$' {
+            # Hook PATCHes the same card; exec must print something or cc-connect says "(no output)"
+            $kind = if ($rest.Count -ge 1) { $rest[0].ToLower() } else { '' }
+            $val = if ($rest.Count -ge 2) { ($rest | Select-Object -Skip 1) -join ' ' } else { '' }
+            switch ($kind) {
+                { $_ -in @('p', 'provider') } { Write-Output "已选供应商 $val" }
+                { $_ -in @('m', 'model') }    { Write-Output "已选模型 $val" }
+                { $_ -in @('t', 'tier') }     { Write-Output "已选别名 $val" }
+                default                       { Write-Output '已记录选择' }
+            }
+        }
+        '^(apply)$' {
+            if ($rest.Count -lt 2) { Write-Output "用法: /ccs apply <供应商> <模型> [档位]`n档位: $TierUsage"; exit 1 }
+            $tierSpec = $null
+            if ($rest.Count -ge 3) {
+                $tierSpec = ConvertTo-CcsTierSpec $rest[-1]
+                if (-not $tierSpec) { Write-Output "未知档位 '$($rest[-1])'，可选: $TierUsage"; exit 1 }
+            }
+            $modelIdx = if ($tierSpec) { $rest.Count - 2 } else { $rest.Count - 1 }
+            $model = $rest[$modelIdx]
+            $query = (($rest[0..($modelIdx - 1)]) -join ' ').Trim()
+            $catalog = Get-CcsCatalog $AppType
+            $target = Resolve-OrFail $catalog $query
+            if (-not $target.Selectable) { Write-Output "🚫 $($target.Name) 不支持代理接管，无法切换"; exit 1 }
+            if (-not $target.Current) { [void](Select-CcsProvider $AppType $target.Id) }
+            switch ($AppType) {
+                'claude' {
+                    if (-not $tierSpec) { $tierSpec = ConvertTo-CcsTierSpec 'all' }
+                    $value = if ($tierSpec.OneM) { Add-CcsOneMSuffix $model } else { $model }
+                    Set-CcsProviderModel $AppType $target.Id $value $tierSpec.Tiers
+                    $scope = if ($tierSpec.Alias) { $tierSpec.Alias } elseif ($tierSpec.Tiers.Count -gt 0) { $tierSpec.Tiers -join ',' } else { '全部档位' }
+                    Write-Output "✅ $($target.Name): $scope → $value，下一次请求即生效"
+                    if ($tierSpec.Alias) { Write-Output "要用这个别名请发 /model $($tierSpec.Alias)" }
+                }
+                'codex' {
+                    Set-CcsProviderModel $AppType $target.Id $model
+                    Write-Output "✅ $($target.Name) 的上游模型已设为 $model，下一次请求即生效"
+                }
+                default {
+                    Write-Output "✅ 已启用 $($target.Name)。选模型: /model $($target.Id)/$model"
+                }
+            }
         }
         '^(switch|use|select|set|to)$' {
             $query = ($rest -join ' ').Trim()

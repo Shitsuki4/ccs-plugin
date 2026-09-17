@@ -7,19 +7,23 @@ cc-connect 和 CC Switch 都可以直接官方升级，不需要本地编译。
 支持 CC Switch 管理的全部应用：Claude Code、Codex、Gemini、Grok Build、Pi、OpenCode、OpenClaw、Hermes。
 
 ```
-/ccs                          列出供应商（飞书收到选择卡片）
-/ccs switch <序号|名称>        切换供应商 → 自动弹出该供应商的模型卡片
+/ccs                          一张卡同时选供应商 / 模型 / 别名，点 ✍️ 写入才生效
+/ccs switch <序号|名称>        切换供应商（兼容旧的分步卡片）
 /ccs models <名称>             该供应商已配置 + 上游可用的模型
 /ccs map <名称> <模型> [档位]   Claude: 把 sonnet / sonnet[1m] / opus / … 映射到该上游模型
                               Codex: 设置该供应商的上游模型
+/ccs apply <名称> <模型> [档位] 切换供应商并写入映射
 /ccs status                   当前供应商与模式
 ```
 
-### Claude 的三步卡片
+### 一张卡三个下拉
 
 ```
-选供应商（any）  →  选上游模型（claude-fable-5-1 …）  →  选映射别名（sonnet[1m] / opus …）  →  一键 /model sonnet[1m]
+① 供应商    ② 模型    ③ 映射别名（Claude）    →  ✍️ 写入
 ```
+
+三个下拉一开始就同时出现。改供应商只刷新模型列表，不会把另外两个藏起来；点写入才真正切供应商、写映射。
+默认预填当前供应商和它正在用的模型，打开就能直接写。
 
 CC Switch 代理按请求里的别名（haiku/sonnet/opus/fable）决定映射到哪个上游模型；插件写的就是这些映射，
 所以 `/model sonnet[1m]` 这类 cc-connect 侧的别名可以继续用，只是它背后的真实模型换了。
@@ -79,16 +83,15 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 ## 工作原理
 
 ```
-/ccs ──▶ cc-connect 钩子 (message.received) ──▶ ccs-hook.ps1 ──▶ 飞书 OpenAPI 发卡片
+/ccs ──▶ cc-connect 钩子 (message.received) ──▶ ccs-hook.ps1 ──▶ 飞书 OpenAPI 发/PATCH 卡片
                                                                       │
-点击按钮 ──▶ cc-connect 原生 cmd: 动作 ──▶ 以点击者身份派发 "/ccs switch <id>"
-                                                                      │
-                                              ccs.ps1 ──▶ 15722 控制接口（热）或 DB+重启（冷）
+下拉选择 ──▶ cmd:/ccs pick p|m|t <值> ──▶ 钩子 PATCH 同一张卡（模型列表随供应商刷新）
+写入按钮 ──▶ cmd:/ccs apply <id> <模型> [档位] ──▶ ccs.ps1 ──▶ 15722（热）或 DB+重启（冷）
 ```
 
-- 钩子只对内容恰好是 `/ccs` 的飞书消息动作，其它消息立即退出
-- 卡片按钮值是 `cmd:/ccs switch <id>`；官方版把自定义 **exec** 当特权命令，调用者必须在该项目的 `admin_from` 里
-- 飞书凭据直接从 `config.toml` 读取，不另存
+- 钩子对 `/ccs` 及其子命令动作；其它消息立即退出
+- 下拉选项值是 `cmd:/ccs pick …`，写入按钮是 `cmd:/ccs apply …`；官方版把自定义 **exec** 当特权命令，调用者必须在该项目的 `admin_from` 里
+- 飞书凭据直接从 `config.toml` 读取，不另存；卡片 `message_id` 存在 `%LOCALAPPDATA%\ccs-plugin\card-*.json`
 
 ## 安全提示
 

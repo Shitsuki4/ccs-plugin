@@ -1,7 +1,7 @@
 # ccs-plugin shared helpers. Dot-sourced by ccs.ps1, ccs-hook.ps1 and install.ps1.
 Set-StrictMode -Version 2.0
 
-$script:CcsPluginVersion = '0.2.0'
+$script:CcsPluginVersion = '0.4.0'
 
 function Get-CcsPaths {
     $userHome = $env:USERPROFILE
