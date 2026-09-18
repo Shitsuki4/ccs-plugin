@@ -4,7 +4,8 @@
 #   ccs.ps1 [list]                              providers (Feishu: one card with 3 dropdowns)
 #   ccs.ps1 pick p|m|t <value>                  card-side selection ack (hook PATCHes the card)
 #   ccs.ps1 apply <target> <model> [<tier>]     switch + map in one shot
-#   ccs.ps1 switch <target>                     switch provider (Pi: enable provider)
+#   ccs.ps1 applycard <key>                     same, with target/model/tier read from the card state
+#   ccs.ps1 switch <target>                     switch provider (direct-config apps: browse only)
 #   ccs.ps1 models <target>                     models the provider offers
 #   ccs.ps1 map <target> <model> [<tier>]       claude: map tier(s) -> model; codex: set upstream model
 #   ccs.ps1 status | help
@@ -80,6 +81,35 @@ function Format-ModelList($Target, $Models) {
     return $sb.ToString()
 }
 
+# Shared by /ccs apply (explicit args) and /ccs applycard (args read from the card state file).
+function Invoke-CcsApply($Catalog, $Target, [string]$Model, $TierSpec) {
+    if (-not $Catalog.ProxyManaged) {
+        Write-Output "ℹ️ $($Target.Name) 是直连配置应用（$AppType）：供应商由 CC Switch 写进应用自己的配置，聊天里切不了，也没有「当前供应商」这回事。"
+        Write-Output "选模型请发: /model $($Target.Id)/$Model"
+        return
+    }
+    if (-not $Target.Selectable) { Write-Output "🚫 $($Target.Name) 不支持代理接管，无法切换"; exit 1 }
+    if (-not $Target.Current) { [void](Select-CcsProvider $AppType $Target.Id) }
+    switch ($AppType) {
+        'claude' {
+            if (-not $TierSpec) { $TierSpec = ConvertTo-CcsTierSpec 'all' }
+            $value = if ($TierSpec.OneM) { Add-CcsOneMSuffix $Model } else { $Model }
+            Set-CcsProviderModel $AppType $Target.Id $value $TierSpec.Tiers
+            $scope = if ($TierSpec.Alias) { $TierSpec.Alias } elseif ($TierSpec.Tiers.Count -gt 0) { $TierSpec.Tiers -join ',' } else { '全部档位' }
+            Write-Output "✅ $($Target.Name): $scope → $value，下一次请求即生效"
+            if ($TierSpec.Alias) { Write-Output "要用这个别名请发 /model $($TierSpec.Alias)" }
+        }
+        'codex' {
+            Set-CcsProviderModel $AppType $Target.Id $Model
+            Write-Output "✅ $($Target.Name) 的上游模型已设为 $Model，下一次请求即生效"
+        }
+        default {
+            Write-Output "❌ 代理接管只支持 claude / codex，$AppType 请用 /model 命令"
+            exit 1
+        }
+    }
+}
+
 try {
     $rest = @($Rest | Where-Object { $_ -ne $null -and $_ -ne '' })
     switch -Regex ($Action.ToLower()) {
@@ -115,25 +145,26 @@ try {
             $query = (($rest[0..($modelIdx - 1)]) -join ' ').Trim()
             $catalog = Get-CcsCatalog $AppType
             $target = Resolve-OrFail $catalog $query
-            if (-not $target.Selectable) { Write-Output "🚫 $($target.Name) 不支持代理接管，无法切换"; exit 1 }
-            if (-not $target.Current) { [void](Select-CcsProvider $AppType $target.Id) }
-            switch ($AppType) {
-                'claude' {
-                    if (-not $tierSpec) { $tierSpec = ConvertTo-CcsTierSpec 'all' }
-                    $value = if ($tierSpec.OneM) { Add-CcsOneMSuffix $model } else { $model }
-                    Set-CcsProviderModel $AppType $target.Id $value $tierSpec.Tiers
-                    $scope = if ($tierSpec.Alias) { $tierSpec.Alias } elseif ($tierSpec.Tiers.Count -gt 0) { $tierSpec.Tiers -join ',' } else { '全部档位' }
-                    Write-Output "✅ $($target.Name): $scope → $value，下一次请求即生效"
-                    if ($tierSpec.Alias) { Write-Output "要用这个别名请发 /model $($tierSpec.Alias)" }
-                }
-                'codex' {
-                    Set-CcsProviderModel $AppType $target.Id $model
-                    Write-Output "✅ $($target.Name) 的上游模型已设为 $model，下一次请求即生效"
-                }
-                default {
-                    Write-Output "✅ 已启用 $($target.Name)。选模型: /model $($target.Id)/$model"
-                }
+            Invoke-CcsApply $catalog $target $model $tierSpec
+        }
+        '^(applycard)$' {
+            # Fired by the card's ✍️ 写入 button. The button only carries the state key, so the
+            # supplier/model/tier are read here — at click time — instead of being frozen into the
+            # card when it was rendered.
+            $key = if ($rest.Count -ge 1) { $rest[0].Trim().ToLower() } else { '' }
+            if ($key -notmatch '^[0-9a-f]{16}$') { Write-Output '❌ 无效的卡片标识，请重新发 /ccs'; exit 1 }
+            $state = Get-CcsCardStateByKey $key
+            if (-not $state) { Write-Output '❌ 卡片选择已失效（卡片太旧或状态被清理），请重新发 /ccs'; exit 1 }
+            if (-not $state.model) { Write-Output '❌ 卡片里还没有选模型，请重新发 /ccs'; exit 1 }
+            $tierSpec = $null
+            if ($state.tier) {
+                $tierSpec = ConvertTo-CcsTierSpec $state.tier
+                if (-not $tierSpec) { Write-Output "❌ 卡片里的档位 '$($state.tier)' 已失效，请重新发 /ccs"; exit 1 }
             }
+            $catalog = Get-CcsCatalog $AppType
+            $target = if ($state.provider_id) { Resolve-OrFail $catalog $state.provider_id } else { $catalog.Providers | Where-Object { $_.Current } | Select-Object -First 1 }
+            if (-not $target) { Write-Output '❌ 卡片里没有供应商，请重新发 /ccs'; exit 1 }
+            Invoke-CcsApply $catalog $target $state.model $tierSpec
         }
         '^(switch|use|select|set|to)$' {
             $query = ($rest -join ' ').Trim()
@@ -141,8 +172,8 @@ try {
             $catalog = Get-CcsCatalog $AppType
             $target = Resolve-OrFail $catalog $query
             if (-not $catalog.ProxyManaged) {
-                [void](Select-CcsProvider $AppType $target.Id)
-                Write-Output "✅ 已启用 $AppType 供应商 $($target.Name)。选模型: /model $($target.Id)/<模型>（共 $($target.Models.Count) 个）"
+                Write-Output "ℹ️ $($target.Name)：$AppType 的供应商由 CC Switch 直接写进应用自己的配置，没有「当前供应商」可切换，聊天里切它是空操作。"
+                Write-Output "看模型: /ccs models $($target.Name)"
                 break
             }
             if ($target.Current) { Write-Output "ℹ️ $($target.Name) 已经是当前 $AppType 供应商"; break }
@@ -201,11 +232,17 @@ try {
         '^(status|current|now)$' {
             $catalog = Get-CcsCatalog $AppType
             $cur = $catalog.Providers | Where-Object { $_.Current } | Select-Object -First 1
-            $modeText = if (-not $catalog.ProxyManaged) { '直连配置（由 CC Switch 写入应用配置）' } elseif ($catalog.Mode -eq 'hot') { '热切换（控制接口在线）' } else { '冷切换（未检测到控制接口）' }
+            if (-not $catalog.ProxyManaged) {
+                Write-Output "$AppType 没有「当前供应商」：CC Switch 只负责增删，由应用自己选模型"
+                $configured = Get-CcsConfiguredModel ([string]$env:CC_HOOK_PROJECT)
+                if ($configured) { Write-Output "cc-connect 正在用: $configured" }
+                Write-Output "模式: 直连配置（CC Switch 写入应用自己的配置）"
+                break
+            }
+            $modeText = if ($catalog.Mode -eq 'hot') { '热切换（控制接口在线）' } else { '冷切换（未检测到控制接口）' }
             $curText = if ($cur) { "$($cur.Name)" + $(if ($cur.Model) { " · $($cur.Model)" } else { '' }) } else { '未设置' }
             Write-Output "当前 $AppType 供应商: $curText"
-            if ($catalog.ProxyManaged) { Write-Output "模式: $modeText · 代理: $(if ($catalog.ProxyRunning) { '运行中' } else { '未运行' })" }
-            else { Write-Output "模式: $modeText" }
+            Write-Output "模式: $modeText · 代理: $(if ($catalog.ProxyRunning) { '运行中' } else { '未运行' })"
         }
         '^(help|-h|--help|\?)$' { Write-Output (Show-Help) }
         default { Write-Output "未知子命令 '$Action'"; Write-Output (Show-Help); exit 1 }

@@ -1,7 +1,7 @@
 # ccs-plugin shared helpers. Dot-sourced by ccs.ps1, ccs-hook.ps1 and install.ps1.
 Set-StrictMode -Version 2.0
 
-$script:CcsPluginVersion = '0.4.0'
+$script:CcsPluginVersion = '0.4.1'
 
 function Get-CcsPaths {
     $userHome = $env:USERPROFILE
@@ -17,6 +17,63 @@ function Get-CcsPaths {
         StateDir      = Join-Path $env:LOCALAPPDATA 'ccs-plugin'
         CardMarker    = Join-Path $env:LOCALAPPDATA 'ccs-plugin\last-card.stamp'
     }
+}
+
+function Read-CcsField($Obj, [string]$Name) {
+    if ($null -eq $Obj) { return '' }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { return [string]$p.Value }
+    return ''
+}
+
+# Card state is keyed by a short hash of the cc-connect session key: the hook writes it on
+# every dropdown pick, ccs.ps1 reads it back when the write button fires. Keying by hash
+# (not by the raw session key) keeps the value short enough to ride inside a button command.
+function Get-CcsCardStateKey([string]$SessionKey) {
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try { $hex = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($SessionKey)))).Replace('-', '') }
+    finally { $sha.Dispose() }
+    return $hex.Substring(0, 16).ToLower()
+}
+
+function Get-CcsCardStatePath([string]$Key) {
+    if ($Key -notmatch '^[0-9a-f]{16}$') { return $null }
+    Join-Path (Get-CcsPaths).StateDir "card-$Key.json"
+}
+
+function Read-CcsCardStateFile([string]$Path) {
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    try { $o = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $o) { return $null }
+    return @{
+        message_id  = Read-CcsField $o 'message_id'
+        provider_id = Read-CcsField $o 'provider_id'
+        model       = Read-CcsField $o 'model'
+        tier        = Read-CcsField $o 'tier'
+    }
+}
+
+function Get-CcsCardState([string]$SessionKey) {
+    Read-CcsCardStateFile (Get-CcsCardStatePath (Get-CcsCardStateKey $SessionKey))
+}
+
+function Get-CcsCardStateByKey([string]$Key) {
+    Read-CcsCardStateFile (Get-CcsCardStatePath $Key)
+}
+
+function Save-CcsCardState([string]$Key, $State) {
+    $path = Get-CcsCardStatePath $Key
+    if (-not $path) { return }
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    $obj = [ordered]@{
+        message_id  = [string]$State.message_id
+        provider_id = [string]$State.provider_id
+        model       = [string]$State.model
+        tier        = [string]$State.tier
+        at          = (Get-Date).ToString('o')
+    }
+    [System.IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding $false))
 }
 
 function Get-CcsSettingsKey([string]$AppType) {
@@ -252,7 +309,7 @@ function Format-CcsCatalog($Catalog, [string]$AppType) {
     if ($Catalog.ProxyManaged -and -not $Catalog.ProxyRunning) { [void]$sb.AppendLine('⚠️ 本地代理未运行，切换不会生效') }
     if ($Catalog.AutoFailover) { [void]$sb.AppendLine('⚠️ 已开启自动故障转移，手动切换会被拒绝') }
     if ($Catalog.ProxyManaged) { [void]$sb.Append('用法: /ccs switch <序号|名称>   /ccs models <名称>') }
-    else { [void]$sb.Append('用法: /ccs switch <序号|名称> 启用供应商，再用 /model <供应商ID>/<模型> 选模型') }
+    else { [void]$sb.Append('用法: /ccs models <序号|名称> 选模型（供应商在 CC Switch 里增删，聊天里切不了）') }
     return $sb.ToString()
 }
 
@@ -396,7 +453,7 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
         if ($t -match '^\[\[projects\]\]$') {
             & $closeProject ($i - 1)
             $cur = [pscustomobject]@{
-                Name = ''; AgentType = ''; WorkDir = ''; AdminFrom = ''; Feishu = $null; StartLine = $i; EndLine = $lines.Count - 1
+                Name = ''; AgentType = ''; WorkDir = ''; Model = ''; AdminFrom = ''; Feishu = $null; StartLine = $i; EndLine = $lines.Count - 1
                 Commands = (New-Object System.Collections.ArrayList); Hooks = (New-Object System.Collections.ArrayList)
             }
             [void]$projects.Add($cur)
@@ -429,7 +486,7 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
             switch ($ctx) {
                 'project'          { if ($k -eq 'name') { $cur.Name = $v } elseif ($k -eq 'admin_from') { $cur.AdminFrom = $v } }
                 'agent'            { if ($k -eq 'type') { $cur.AgentType = $v } }
-                'agent.options'    { if ($k -eq 'work_dir') { $cur.WorkDir = $v } }
+                'agent.options'    { if ($k -eq 'work_dir') { $cur.WorkDir = $v } elseif ($k -eq 'model') { $cur.Model = $v } }
                 'platform'         { if ($k -eq 'type') { $platform.Type = $v } else { $platform.Options[$k] = $v } }
                 'platform.options' { if ($platform) { $platform.Options[$k] = $v } }
                 'command'          { if ($k -eq 'name') { $command.Name = $v } elseif ($k -eq 'exec') { $command.Exec = $v }; $command.EndLine = $i }
@@ -442,6 +499,17 @@ function Get-CcsConnectProjects([string]$ConfigPath) {
     }
     & $closeProject ($lines.Count - 1)
     return @($projects)
+}
+
+# Direct-config apps keep no current provider in CC Switch — the app's own config is the truth.
+# cc-connect stores the selection as "<providerId>/<model>", which is what their card opens on.
+function Get-CcsConfiguredModel([string]$ProjectName) {
+    if (-not $ProjectName) { return '' }
+    try {
+        $proj = Get-CcsConnectProjects (Get-CcsPaths).ConnectConfig | Where-Object { $_.Name -eq $ProjectName } | Select-Object -First 1
+        if ($proj) { return [string]$proj.Model }
+    } catch {}
+    return ''
 }
 
 # Official cc-connect only loads top-level [[commands]] / [[hooks]] (not [[projects.*]]).

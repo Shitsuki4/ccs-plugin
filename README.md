@@ -25,6 +25,21 @@ cc-connect 和 CC Switch 都可以直接官方升级，不需要本地编译。
 三个下拉一开始就同时出现。改供应商只刷新模型列表，不会把另外两个藏起来；点写入才真正切供应商、写映射。
 默认预填当前供应商和它正在用的模型，打开就能直接写。
 
+写入按钮只带一个卡片状态键，真正的供应商/模型/档位是**点下去那一刻**从状态文件里读的，不是渲染卡片时烤进去的。
+
+### 直连配置的应用（Pi / OpenCode / OpenClaw / Hermes）
+
+CC Switch 对这类应用不是「改代理指向」，而是把供应商直接写进应用自己的配置文件，因此**没有「当前供应商」这个概念**——
+桌面端也只有增删供应商，没有切换。`POST /providers/pi/select` 会返回 200 但不持久化任何东西。
+
+所以这类应用的卡片不一样：
+
+- ① 供应商是**只读浏览**，只决定 ② 里列哪家的模型；打开时定位到 cc-connect 当前在用的那家
+- ② 每个模型选项就是一个完整的 `/model <供应商ID>/<模型>` 命令，**选中即刻生效**，没有写入按钮
+- 没有 ③ 别名行
+
+卡片的 `② 模型` 是逐选项自带完整命令的，所以无论点得多快，执行的都一定是当前选项本身。
+
 CC Switch 代理按请求里的别名（haiku/sonnet/opus/fable）决定映射到哪个上游模型；插件写的就是这些映射，
 所以 `/model sonnet[1m]` 这类 cc-connect 侧的别名可以继续用，只是它背后的真实模型换了。
 
@@ -47,7 +62,7 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 
 官方 CC Switch 把当前供应商缓存在进程内存里，外部程序改不了，所以切换要么重启它（冷切换，代理中断约 10 秒，仅 Claude/Codex/Gemini/Grok），
 要么用本仓库 [GitHub Actions](.github/workflows/build-cc-switch.yml) 自动构建的补丁版——官方源码 + `patches/control_api.rs`，
-在 `127.0.0.1:15722` 暴露一个只监听回环、Bearer 令牌鉴权的控制接口。模型映射、上游模型列表、Pi 等直连应用的切换都需要它。
+在 `127.0.0.1:15722` 暴露一个只监听回环、Bearer 令牌鉴权的控制接口。模型映射、上游模型列表，以及 Pi 等直连应用的供应商/模型列表都走它。
 
 ```powershell
 # 从本仓库 Release 下载补丁版并替换（会关闭并重启 CC Switch）
@@ -64,7 +79,7 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 | 请求 | 说明 |
 |---|---|
 | `GET /api/v1/providers/{app}` | 供应商列表、当前 ID、`proxy_managed`、`proxy_running`、`auto_failover` |
-| `POST /api/v1/providers/{app}/select` `{"id"}` | 切换供应商（代理应用热切换；Pi 等直连应用走桌面端原生切换） |
+| `POST /api/v1/providers/{app}/select` `{"id"}` | 切换供应商（仅对代理应用 claude/codex 有效；Pi 等直连应用返回 200 但不持久化，`current_id` 恒为空） |
 | `GET /api/v1/providers/{app}/models/{id}` | 已配置模型 + 上游 `/v1/models`（Claude），密钥不出进程 |
 | `POST /api/v1/providers/{app}/model` `{"id","model","tiers"?}` | Claude: 写 `ANTHROPIC_DEFAULT_*_MODEL`；Codex: 写 config.toml 的 `model` |
 
@@ -85,13 +100,14 @@ irm https://raw.githubusercontent.com/Shitsuki4/ccs-plugin/main/install.ps1 | ie
 ```
 /ccs ──▶ cc-connect 钩子 (message.received) ──▶ ccs-hook.ps1 ──▶ 飞书 OpenAPI 发/PATCH 卡片
                                                                       │
-下拉选择 ──▶ cmd:/ccs pick p|m|t <值> ──▶ 钩子 PATCH 同一张卡（模型列表随供应商刷新）
-写入按钮 ──▶ cmd:/ccs apply <id> <模型> [档位] ──▶ ccs.ps1 ──▶ 15722（热）或 DB+重启（冷）
+下拉选择 ──▶ cmd:/ccs pick p|m|t <值> ──▶ 钩子写状态文件 + PATCH 同一张卡（模型列表随供应商刷新）
+写入按钮 ──▶ cmd:/ccs applycard <状态键> ──▶ ccs.ps1 读状态 ──▶ 15722（热）或 DB+重启（冷）
+直连应用 ──▶ cmd:/model <供应商ID>/<模型> ──▶ cc-connect 内置命令，不经过钩子
 ```
 
-- 钩子对 `/ccs` 及其子命令动作；其它消息立即退出
-- 下拉选项值是 `cmd:/ccs pick …`，写入按钮是 `cmd:/ccs apply …`；官方版把自定义 **exec** 当特权命令，调用者必须在该项目的 `admin_from` 里
-- 飞书凭据直接从 `config.toml` 读取，不另存；卡片 `message_id` 存在 `%LOCALAPPDATA%\ccs-plugin\card-*.json`
+- 钩子对 `/ccs` 及其子命令动作；其它消息（包括 `/model …`）立即退出
+- 下拉选项值是 `cmd:/ccs pick …`（直连应用的模型下拉是 `cmd:/model …`），写入按钮是 `cmd:/ccs applycard …`；官方版把自定义 **exec** 当特权命令，调用者必须在该项目的 `admin_from` 里
+- 飞书凭据直接从 `config.toml` 读取，不另存；卡片 `message_id` 存在 `%LOCALAPPDATA%\ccs-plugin\card-<会话键哈希>.json`
 
 ## 安全提示
 

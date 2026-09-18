@@ -4,11 +4,14 @@
 #   /ccs pick p <id>    -> record provider choice, patch the same card in place
 #   /ccs pick m <model> -> record model choice, patch the same card in place
 #   /ccs pick t <tier>  -> record alias choice, patch the same card in place
-#   /ccs apply ...      -> executed by ccs.ps1 (hook stays out of the way)
+#   /ccs apply|applycard …  -> executed by ccs.ps1 (hook stays out of the way)
 #
 # select_static option values carry "cmd:" so cc-connect dispatches them as commands;
 # the hook then PATCHes the stored card message_id (im/v1/messages/:id) so all three
-# selections accumulate on ONE card and the apply button bakes in the full triple.
+# selections accumulate on ONE card. The apply button carries only the state key — the
+# selection is read from that file when the button fires, never baked into the card.
+# Apps CC Switch configures directly (Pi) get no apply button: their model options carry a
+# self-contained "/model <providerId>/<model>" instead, and their provider row is browse-only.
 # Legacy text flows still work: /ccs switch|models|map render the old chained cards.
 [CmdletBinding()]
 param(
@@ -89,34 +92,8 @@ function Update-FeishuCard([string]$Token, [string]$Domain, [string]$MessageId, 
     if ($r.code -ne 0) { throw "更新卡片失败: $($r.code) $($r.msg)" }
 }
 
-function Get-CcsCardStatePath([string]$SessionKey) {
-    $sha = [System.Security.Cryptography.SHA1]::Create()
-    $hex = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($SessionKey)))).Replace('-', '').Substring(0, 16).ToLower()
-    Join-Path $paths.StateDir "card-$hex.json"
-}
-function Save-CcsCardState([string]$SessionKey, $State) {
-    $obj = [ordered]@{
-        message_id  = [string]$State.message_id
-        provider_id = [string]$State.provider_id
-        model       = [string]$State.model
-        tier        = [string]$State.tier
-        at          = (Get-Date).ToString('o')
-    }
-    [System.IO.File]::WriteAllText((Get-CcsCardStatePath $SessionKey), ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding $false))
-}
-function Get-CcsCardState([string]$SessionKey) {
-    $p = Get-CcsCardStatePath $SessionKey
-    if (-not (Test-Path $p)) { return $null }
-    try {
-        $o = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
-        return @{
-            message_id  = [string]$o.message_id
-            provider_id = [string]$o.provider_id
-            model       = [string]$o.model
-            tier        = [string]$o.tier
-        }
-    } catch { return $null }
-}
+# Card state helpers (Get-CcsCardState / Save-CcsCardState / Get-CcsCardStateKey) live in
+# ccs-common.ps1 so ccs.ps1 can read the latest dropdown selection at apply time.
 
 function New-CmdButton([string]$Label, [string]$Command, [string]$Type, [string]$AfterTitle, [string]$AfterMarkdown) {
     $value = @{ action = "cmd:$Command"; session_key = $sessionKey }
@@ -172,13 +149,15 @@ function Get-OrderedModels($Models) {
 }
 
 # One card, three dropdowns always visible. Changing provider only swaps the
-# model list; model/alias picks just update the baked-in apply command.
+# model list; the write button reads the accumulated selection when it fires.
 function New-ComboCard($Catalog, [hashtable]$Sel) {
     foreach ($k in @('provider_id', 'model', 'tier')) { if (-not $Sel.ContainsKey($k)) { $Sel[$k] = '' } }
     $current = $Catalog.Providers | Where-Object { $_.Current } | Select-Object -First 1
     $target = $null
     if ($Sel.provider_id) { $target = $Catalog.Providers | Where-Object { $_.Id -eq $Sel.provider_id } | Select-Object -First 1 }
     if (-not $target) { $target = $current }
+    # Direct-config apps have no current provider; open on the first one instead of nothing.
+    if (-not $target) { $target = $Catalog.Providers | Select-Object -First 1 }
 
     $models = $null
     $ordered = @()
@@ -197,14 +176,22 @@ function New-ComboCard($Catalog, [hashtable]$Sel) {
     }
 
     $elements = New-Object System.Collections.ArrayList
-    $live = if ($current) { "**$($current.Name)**" + $(if ($current.Model) { " · $($current.Model)" } else { '' }) } else { '未设置' }
-    $picked = @()
-    if ($target) { $picked += $target.Name }
-    if ($Sel.model) { $picked += $Sel.model }
-    if ($Sel.tier) { $picked += $Sel.tier }
-    $pickedText = if ($picked.Count -gt 0) { $picked -join '  →  ' } else { '（尚未选择）' }
-    $modeText = if (-not $Catalog.ProxyManaged) { '直连配置' } elseif ($Catalog.Mode -eq 'hot') { '热切换，写入后下一次请求即生效' } else { '冷切换，写入会重启代理' }
-    [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = "当前运行：$live`n本次选择：**$pickedText**`n$modeText" } })
+    $direct = -not $Catalog.ProxyManaged
+    # Direct-config apps have no current provider; the running pairing is the one in the card.
+    $live = if ($direct -and $target) { "**$($target.Name)**" + $(if ($Sel.model) { " · $($Sel.model)" } else { '' }) }
+            elseif ($current) { "**$($current.Name)**" + $(if ($current.Model) { " · $($current.Model)" } else { '' }) }
+            else { '未设置' }
+    if ($direct) {
+        [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = "当前运行：$live`n直连配置：CC Switch 把供应商直接写进 $AppType 自己的配置，没有「当前供应商」可切换；模型下拉选中即刻执行 /model" } })
+    } else {
+        $picked = @()
+        if ($target) { $picked += $target.Name }
+        if ($Sel.model) { $picked += $Sel.model }
+        if ($Sel.tier) { $picked += $Sel.tier }
+        $pickedText = if ($picked.Count -gt 0) { $picked -join '  →  ' } else { '（尚未选择）' }
+        $modeText = if ($Catalog.Mode -eq 'hot') { '热切换，写入后下一次请求即生效' } else { '冷切换，写入会重启代理' }
+        [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = "当前运行：$live`n本次选择：**$pickedText**`n$modeText" } })
+    }
     if ($Catalog.ProxyManaged -and -not $Catalog.ProxyRunning) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '⚠️ 本地代理未运行，切换不会生效' } }) }
     if ($Catalog.AutoFailover) { [void]$elements.Add(@{ tag = 'div'; text = @{ tag = 'lark_md'; content = '⚠️ 已开启自动故障转移，手动切换会被拒绝' } }) }
 
@@ -215,7 +202,7 @@ function New-ComboCard($Catalog, [hashtable]$Sel) {
         @{ Text = $text; Value = (ConvertTo-PickCmd 'p' $p.Id) }
     }
     $pInit = if ($target) { ConvertTo-PickCmd 'p' $target.Id } else { $null }
-    [void]$elements.Add((New-SelectRow '① 供应商' $pOpts $pInit))
+    [void]$elements.Add((New-SelectRow $(if ($direct) { '① 供应商（仅浏览）' } else { '① 供应商' }) $pOpts $pInit))
 
     $shown = @($ordered | Select-Object -First 100)
     if ($shown.Count -eq 0) {
@@ -223,10 +210,15 @@ function New-ComboCard($Catalog, [hashtable]$Sel) {
     } else {
         $mOpts = foreach ($m in $shown) {
             $star = ($models -and ($models.Configured -contains $m))
-            @{ Text = $(if ($star) { "⭐ $m" } else { $m }); Value = (ConvertTo-PickCmd 'm' $m) }
+            # Direct-config apps: bake the whole command into the option so the value is correct by
+            # construction, however fast the click lands after the pick.
+            $cmd = if ($direct -and $target) { "/model $($target.Id)/$m" } else { ConvertTo-PickCmd 'm' $m }
+            @{ Text = $(if ($star) { "⭐ $m" } else { $m }); Value = $cmd }
         }
-        $mInit = if ($Sel.model) { ConvertTo-PickCmd 'm' $Sel.model } else { $null }
-        [void]$elements.Add((New-SelectRow '② 模型' $mOpts $mInit))
+        $mInit = if ($Sel.model) {
+            if ($direct -and $target) { "/model $($target.Id)/$($Sel.model)" } else { ConvertTo-PickCmd 'm' $Sel.model }
+        } else { $null }
+        [void]$elements.Add((New-SelectRow $(if ($direct) { '② 模型（选中即刻生效）' } else { '② 模型' }) $mOpts $mInit))
         if ($ordered.Count -gt $shown.Count) {
             [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = "还有 $($ordered.Count - $shown.Count) 个模型未列出" }) })
         }
@@ -244,19 +236,24 @@ function New-ComboCard($Catalog, [hashtable]$Sel) {
         [void]$elements.Add((New-SelectRow '③ 映射别名' $tOpts $tInit))
     }
 
-    $ready = $target -and $Sel.model -and ($AppType -ne 'claude' -or $Sel.tier)
+    # The button carries only the state key; ccs.ps1 reads the latest selection when it fires, so
+    # the applied model can no longer be a value that was stale at render time.
+    $ready = (-not $direct) -and $target -and $Sel.model -and ($AppType -ne 'claude' -or $Sel.tier)
     $btns = New-Object System.Collections.ArrayList
     if ($ready) {
-        $applyCmd = if ($AppType -eq 'claude') { "/ccs apply $($target.Id) $($Sel.model) $($Sel.tier)" } else { "/ccs apply $($target.Id) $($Sel.model)" }
-        [void]$btns.Add((New-CmdButton '✍️ 写入' $applyCmd 'primary' "⏳ 正在写入 $($target.Name) · $($Sel.model)$(if ($Sel.tier) { " → $($Sel.tier)" })…" '结果稍后以消息回复。'))
+        [void]$btns.Add((New-CmdButton '✍️ 写入' "/ccs applycard $(Get-CcsCardStateKey $sessionKey)" 'primary' '⏳ 正在写入…' '实际生效的供应商与模型会写在结果里。'))
     }
     [void]$btns.Add((New-CmdButton '🔄 重置' '/ccs' 'default' $null $null))
     Add-ButtonRows $elements $btns 2
 
-    $blocked = @($Catalog.Providers | Where-Object { -not $_.Selectable } | ForEach-Object { $_.Name })
-    if ($blocked.Count -gt 0) { [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = ('不可通过代理切换: ' + ($blocked -join ' / ')) }) }) }
+    if ($direct) {
+        [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = '供应商在 CC Switch 里增删；这张卡只负责把模型发给 cc-connect' }) })
+    } else {
+        $blocked = @($Catalog.Providers | Where-Object { -not $_.Selectable } | ForEach-Object { $_.Name })
+        if ($blocked.Count -gt 0) { [void]$elements.Add(@{ tag = 'note'; elements = @(@{ tag = 'plain_text'; content = ('不可通过代理切换: ' + ($blocked -join ' / ')) }) }) }
+    }
 
-    $template = if ($ready) { 'green' } else { 'blue' }
+    $template = if ($ready) { 'green' } elseif ($direct) { 'turquoise' } else { 'blue' }
     New-Card "CC Switch · $AppType" $template $elements
 }
 
@@ -329,6 +326,18 @@ try {
                 model       = $(if ($cur -and $cur.Model) { [string]$cur.Model } else { '' })
                 tier        = $(if ($AppType -eq 'claude') { 'sonnet' } else { '' })
             }
+            if (-not $catalog.ProxyManaged) {
+                # No current provider to fall back on: seed from the "<providerId>/<model>" that
+                # cc-connect is actually running, so the card opens on the live pairing.
+                $configured = Get-CcsConfiguredModel $project
+                if ($configured -match '^([^/]+)/(.+)$') {
+                    $seedId = $Matches[1]; $seedModel = $Matches[2]
+                    if ($catalog.Providers | Where-Object { $_.Id -eq $seedId }) {
+                        $sel.provider_id = $seedId
+                        $sel.model = $seedModel
+                    }
+                }
+            }
             $card = New-ComboCard $catalog $sel
         }
         'pick' {
@@ -350,20 +359,24 @@ try {
             switch ($kind) {
                 'p' {
                     $t = Resolve-CcsProvider $catalog.Providers $val
-                    if (-not $t -or -not $t.Selectable) { exit 0 }
+                    if (-not $t) { exit 0 }
+                    if ($catalog.ProxyManaged -and -not $t.Selectable) { exit 0 }
                     $sel.provider_id = $t.Id
                     $sel.model = ''
                 }
                 'm' { if (-not $sel.provider_id) { exit 0 }; $sel.model = $val }
                 't' { $sel.tier = $val }
             }
-            $card = New-ComboCard $catalog $sel
-            Save-CcsCardState $sessionKey @{
+            # Persist before the slow render. The write button carries only this key and reads the
+            # file at click time, so the earlier the pick lands the smaller the window in which a
+            # fast click applies the previous selection instead of this one.
+            Save-CcsCardState (Get-CcsCardStateKey $sessionKey) @{
                 message_id  = $patchMessageId
                 provider_id = $sel.provider_id
                 model       = $sel.model
                 tier        = $sel.tier
             }
+            $card = New-ComboCard $catalog $sel
         }
         'models' {
             $catalog = Get-CcsCatalog $AppType
@@ -404,7 +417,7 @@ try {
             Write-HookLog "PATCH failed, sending new card: $($_.Exception.Message)"
             $msgId = Send-FeishuMessage $token $cred.Domain $chatId 'interactive' ($card | ConvertTo-Json -Depth 12 -Compress)
             if ($msgId -and $sel) {
-                Save-CcsCardState $sessionKey @{
+                Save-CcsCardState (Get-CcsCardStateKey $sessionKey) @{
                     message_id  = $msgId
                     provider_id = $sel.provider_id
                     model       = $sel.model
@@ -415,7 +428,7 @@ try {
     } else {
         $msgId = Send-FeishuMessage $token $cred.Domain $chatId 'interactive' ($card | ConvertTo-Json -Depth 12 -Compress)
         if ($step -eq 'cascade' -and $msgId) {
-            Save-CcsCardState $sessionKey @{
+            Save-CcsCardState (Get-CcsCardStateKey $sessionKey) @{
                 message_id  = $msgId
                 provider_id = $sel.provider_id
                 model       = $sel.model
